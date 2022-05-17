@@ -32,6 +32,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import SGD, Adam, AdamW, lr_scheduler
 from tqdm import tqdm
 
+import json
+import torch.multiprocessing as mp
+
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
@@ -57,9 +60,11 @@ from utils.metrics import fitness
 from utils.plots import plot_evolve, plot_labels
 from utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, select_device, torch_distributed_zero_first
 
-LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
-RANK = int(os.getenv('RANK', -1))
-WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
+#LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
+#RANK = int(os.getenv('RANK', -1))
+#WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
+
+WORLD_SIZE = RANK = LOCAL_RANK = 0
 
 
 def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictionary
@@ -321,8 +326,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         pbar = enumerate(train_loader)
         LOGGER.info(('\n' + '%10s' * 7) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'labels', 'img_size'))
         if RANK in {-1, 0}:
-            #pbar = tqdm(pbar, total=nb, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
-            pbar = tqdm(pbar, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
+            pbar = tqdm(pbar, total=nb, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
         optimizer.zero_grad()
         for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
             callbacks.run('on_train_batch_start')
@@ -482,7 +486,7 @@ def parse_opt(known=False):
     parser.add_argument('--data', type=str, default=ROOT / 'data/coco128.yaml', help='dataset.yaml path')
     parser.add_argument('--hyp', type=str, default=ROOT / 'data/hyps/hyp.scratch-low.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=300)
-    parser.add_argument('--batch-size', type=int, default=16, help='total batch size for all GPUs, -1 for autobatch')
+    parser.add_argument('--batch_size', type=int, dest='batch_size', default=16, help='total batch size for all GPUs, -1 for autobatch')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='train, val image size (pixels)')
     parser.add_argument('--rect', action='store_true', help='rectangular training')
     parser.add_argument('--resume', nargs='?', const=True, default=False, help='resume most recent training')
@@ -521,7 +525,20 @@ def parse_opt(known=False):
     return opt
 
 
-def main(opt, callbacks=Callbacks()):
+def main(local_rank, opt, callbacks=Callbacks()):
+    global WORLD_SIZE, RANK, LOCAL_RANK
+    LOCAL_RANK = local_rank
+    gpus = int(os.environ['SM_NUM_GPUS'])
+    WORLD_SIZE = len(json.loads(os.environ['SM_HOSTS'])) * gpus
+    hosts = json.loads(os.environ['SM_HOSTS'])
+    RANK = hosts.index(os.environ['SM_CURRENT_HOST']) * gpus + local_rank
+    os.environ['WORLD_SIZE'] = str(WORLD_SIZE)
+    os.environ['RANK'] = str(RANK)
+    master = json.loads(os.environ['SM_TRAINING_ENV'])['master_hostname']
+    os.environ['MASTER_ADDR'] = master #args.hosts[0]
+    os.environ['MASTER_PORT'] = '23456'
+    LOGGER.info(f"world_size:{WORLD_SIZE},rank={RANK},local_rank={LOCAL_RANK},master={master}")
+
     # Checks
     if RANK in {-1, 0}:
         print_args(vars(opt))
@@ -546,7 +563,8 @@ def main(opt, callbacks=Callbacks()):
             opt.exist_ok, opt.resume = opt.resume, False  # pass resume to exist_ok and disable resume
         if opt.name == 'cfg':
             opt.name = Path(opt.cfg).stem  # use model.yaml as name
-        opt.save_dir = str(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))
+        #opt.save_dir = str(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))
+        opt.save_dir = str(increment_path(os.environ['SM_OUTPUT_DATA_DIR']+ '/' + opt.name, exist_ok=opt.exist_ok))
 
     # DDP mode
     device = select_device(opt.device, batch_size=opt.batch_size)
@@ -559,7 +577,8 @@ def main(opt, callbacks=Callbacks()):
         assert torch.cuda.device_count() > LOCAL_RANK, 'insufficient CUDA devices for DDP command'
         torch.cuda.set_device(LOCAL_RANK)
         device = torch.device('cuda', LOCAL_RANK)
-        dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo")
+        #dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo")
+        dist.init_process_group(backend='nccl', init_method='env://', rank=RANK, world_size=WORLD_SIZE)
 
     # Train
     if not opt.evolve:
@@ -667,5 +686,20 @@ def run(**kwargs):
 
 
 if __name__ == "__main__":
+    os.environ['WANDB_SILENT']="true"
+    gpus = int(os.environ['SM_NUM_GPUS'])
+    world_size = len(json.loads(os.environ['SM_HOSTS'])) * gpus
+
     opt = parse_opt()
-    main(opt)
+
+    try:
+        if world_size > 1:
+            mp.spawn(main, nprocs=gpus, args=(opt,), join=True, daemon=False)
+        else:
+            main(0, opt)
+    except Exception as e:
+        print(e)
+        try:
+            sys.exit(0)
+        except SystemExit:
+            os._exit(0)
