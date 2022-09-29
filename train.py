@@ -21,7 +21,7 @@ import time
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-
+import zipfile
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -481,6 +481,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
 def parse_opt(known=False):
     parser = argparse.ArgumentParser()
+    parser.add_argument('--zipfile', type=str, default='', help='dataset zip file path')
     parser.add_argument('--weights', type=str, default=ROOT / 'yolov5s.pt', help='initial weights path')
     parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
     parser.add_argument('--data', type=str, default=ROOT / 'data/coco128.yaml', help='dataset.yaml path')
@@ -527,6 +528,11 @@ def parse_opt(known=False):
 
 def main(local_rank, opt, callbacks=Callbacks()):
     global WORLD_SIZE, RANK, LOCAL_RANK
+
+    if len(opt.zipfile) != 0:
+        with zipfile.ZipFile(opt.zipfile, 'r') as zip_ref:
+            zip_ref.extractall(os.path.join(os.getcwd(), 'data'))
+
     LOCAL_RANK = local_rank
     gpus = int(os.environ['SM_NUM_GPUS'])
     WORLD_SIZE = len(json.loads(os.environ['SM_HOSTS'])) * gpus
